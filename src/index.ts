@@ -1,5 +1,11 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  CallToolResult,
+  ListToolsRequestSchema,
+  Tool,
+} from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 const NWS_API_BASE = "https://api.weather.gov";
@@ -71,13 +77,9 @@ interface GridpointResponse {
   };
 }
 
-const server = new McpServer({
+const server = new Server({
   name: "clear-night-sky",
   version: "0.1.0",
-  capabilities: {
-    resources: {},
-    tools: {},
-  },
 });
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -210,195 +212,292 @@ function formatVisibility(value: number | null | undefined, uom?: string): strin
   return `${value}`;
 }
 
-server.tool(
-  "resolve_point_metadata",
-  "Resolve National Weather Service metadata for latitude/longitude.",
+type ToolExecutor = (args: Record<string, unknown>) => Promise<CallToolResult>;
+
+function toTextResult(text: string, isError = false): CallToolResult {
+  return {
+    content: [
+      {
+        type: "text",
+        text,
+      },
+    ],
+    isError,
+  };
+}
+
+function formatZodIssues(error: z.ZodError): string {
+  return error.issues
+    .map((issue) => {
+      const path = issue.path.length ? issue.path.join(".") : "arguments";
+      return `${path}: ${issue.message}`;
+    })
+    .join("; ");
+}
+
+function parseArguments<T>(schema: z.ZodType<T>, rawArgs: Record<string, unknown>): T {
+  const result = schema.safeParse(rawArgs);
+  if (!result.success) {
+    throw new Error(formatZodIssues(result.error));
+  }
+  return result.data;
+}
+
+const coordinateArgumentParser = z.object({
+  latitude: z.coerce.number().min(-90).max(90),
+  longitude: z.coerce.number().min(-180).max(180),
+});
+
+const dailyForecastArgumentParser = coordinateArgumentParser.extend({
+  periods: z.coerce.number().min(1).max(14).default(6),
+});
+
+const hourlyForecastArgumentParser = coordinateArgumentParser.extend({
+  hours: z.coerce.number().min(1).max(24).default(6),
+});
+
+const clearSkyArgumentParser = coordinateArgumentParser.extend({
+  horizonHours: z.coerce.number().min(3).max(24).default(12),
+});
+
+function asToolInputSchema(schema: Record<string, unknown>): Tool["inputSchema"] {
+  return schema as Tool["inputSchema"];
+}
+
+const coordinateProperties = {
+  latitude: {
+    type: "number",
+    minimum: -90,
+    maximum: 90,
+    description: "Latitude of the observing location (decimal degrees).",
+  },
+  longitude: {
+    type: "number",
+    minimum: -180,
+    maximum: 180,
+    description: "Longitude of the observing location (decimal degrees).",
+  },
+} as const;
+
+const resolvePointInputSchema = asToolInputSchema({
+  type: "object",
+  properties: coordinateProperties,
+  required: ["latitude", "longitude"],
+});
+
+const dailyForecastInputSchema = asToolInputSchema({
+  type: "object",
+  properties: {
+    ...coordinateProperties,
+    periods: {
+      type: "integer",
+      minimum: 1,
+      maximum: 14,
+      default: 6,
+      description: "How many forecast periods to return (each period ~12 hours).",
+    },
+  },
+  required: ["latitude", "longitude"],
+});
+
+const hourlyForecastInputSchema = asToolInputSchema({
+  type: "object",
+  properties: {
+    ...coordinateProperties,
+    hours: {
+      type: "integer",
+      minimum: 1,
+      maximum: 24,
+      default: 6,
+      description: "How many hourly entries to include (short-term outlook).",
+    },
+  },
+  required: ["latitude", "longitude"],
+});
+
+const clearSkyInputSchema = asToolInputSchema({
+  type: "object",
+  properties: {
+    ...coordinateProperties,
+    horizonHours: {
+      type: "integer",
+      minimum: 3,
+      maximum: 24,
+      default: 12,
+      description: "Number of hours ahead to analyze for observing windows.",
+    },
+  },
+  required: ["latitude", "longitude"],
+});
+
+const toolDefinitions: Tool[] = [
   {
-    latitude: z.number().min(-90).max(90).describe("Latitude of the observing location"),
-    longitude: z.number().min(-180).max(180).describe("Longitude of the observing location"),
+    name: "resolve_point_metadata",
+    description: "Resolve NWS metadata for a coordinate pair, including grid and time zone details.",
+    inputSchema: resolvePointInputSchema,
   },
-  async ({ latitude, longitude }) => {
-    try {
-      const points = await getPointMetadata(latitude, longitude);
-      return {
-        content: [
-          {
-            type: "text",
-            text: formatCoordinateSummary(points, latitude, longitude),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Unable to resolve metadata for ${latitude}, ${longitude}. ${error instanceof Error ? error.message : ""}`.trim(),
-          },
-        ],
-      };
-    }
-  },
-);
-
-server.tool(
-  "get_daily_forecast",
-  "Retrieve the next National Weather Service forecast periods (up to 7-day forecast).",
   {
-    latitude: z.number().min(-90).max(90).describe("Latitude of the observing location"),
-    longitude: z.number().min(-180).max(180).describe("Longitude of the observing location"),
-    periods: z.number().min(1).max(14).default(6).describe("How many forecast periods to return"),
+    name: "get_daily_forecast",
+    description: "Fetch the multi-period NWS forecast for the provided coordinates.",
+    inputSchema: dailyForecastInputSchema,
   },
-  async ({ latitude, longitude, periods }) => {
-    try {
-      const points = await getPointMetadata(latitude, longitude);
-      const forecastUrl = points.properties.forecast;
-      if (!forecastUrl) {
-        throw new Error("Forecast URL not available for this coordinate (NWS may not cover the location).");
-      }
-      const forecast = await fetchJson<ForecastResponse>(forecastUrl);
-      const periodsData = forecast.properties?.periods ?? [];
-      return {
-        content: [
-          {
-            type: "text",
-            text: formatForecast(periodsData, periods, `NWS forecast for ${latitude.toFixed(4)}, ${longitude.toFixed(4)}`),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Unable to fetch daily forecast. ${error instanceof Error ? error.message : ""}`.trim(),
-          },
-        ],
-      };
-    }
-  },
-);
-
-server.tool(
-  "get_hourly_forecast",
-  "Retrieve hourly forecast periods to inspect short-term sky conditions.",
   {
-    latitude: z.number().min(-90).max(90).describe("Latitude of the observing location"),
-    longitude: z.number().min(-180).max(180).describe("Longitude of the observing location"),
-    hours: z.number().min(1).max(24).default(6).describe("How many hourly periods to include"),
+    name: "get_hourly_forecast",
+    description: "Fetch hourly NWS forecast periods for near-term planning.",
+    inputSchema: hourlyForecastInputSchema,
   },
-  async ({ latitude, longitude, hours }) => {
-    try {
-      const points = await getPointMetadata(latitude, longitude);
-      const hourlyUrl = points.properties.forecastHourly;
-      if (!hourlyUrl) {
-        throw new Error("Hourly forecast URL not available for this coordinate.");
-      }
-      const forecast = await fetchJson<ForecastResponse>(hourlyUrl);
-      const periodsData = forecast.properties?.periods ?? [];
-      return {
-        content: [
-          {
-            type: "text",
-            text: formatForecast(periodsData, hours, `Hourly forecast for ${latitude.toFixed(4)}, ${longitude.toFixed(4)}`),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Unable to fetch hourly forecast. ${error instanceof Error ? error.message : ""}`.trim(),
-          },
-        ],
-      };
-    }
-  },
-);
-
-server.tool(
-  "get_clear_sky_window",
-  "Analyze sky cover, precipitation probability, and visibility to find promising observing windows.",
   {
-    latitude: z.number().min(-90).max(90).describe("Latitude of the observing location"),
-    longitude: z.number().min(-180).max(180).describe("Longitude of the observing location"),
-    horizonHours: z.number().min(3).max(24).default(12).describe("How many hours ahead to analyze"),
+    name: "get_clear_sky_window",
+    description: "Analyze sky cover, precipitation, and visibility to highlight the best observing window.",
+    inputSchema: clearSkyInputSchema,
   },
-  async ({ latitude, longitude, horizonHours }) => {
-    try {
-      const points = await getPointMetadata(latitude, longitude);
-      const gridUrl = points.properties.forecastGridData;
-      if (!gridUrl) {
-        throw new Error("Grid data URL not available for this coordinate.");
-      }
-      const gridData = await fetchJson<GridpointResponse>(gridUrl);
-      const skySeries = gridData.properties.skyCover?.values ?? [];
-      if (!skySeries.length) {
-        throw new Error("Sky cover data not available.");
-      }
-      const precipSeries = gridData.properties.probabilityOfPrecipitation?.values ?? [];
-      const visibilitySeries = gridData.properties.visibility?.values ?? [];
-      const visibilityUnit = gridData.properties.visibility?.uom;
+];
 
-      const windowLength = Math.min(horizonHours, skySeries.length);
-      let bestIndex = -1;
-      let bestScore = Number.POSITIVE_INFINITY;
-      const rows: string[] = [];
+const handleResolvePointMetadata: ToolExecutor = async (rawArgs) => {
+  try {
+    const { latitude, longitude } = parseArguments(coordinateArgumentParser, rawArgs);
+    const points = await getPointMetadata(latitude, longitude);
+    return toTextResult(formatCoordinateSummary(points, latitude, longitude));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return toTextResult(`Unable to resolve metadata. ${message}`, true);
+  }
+};
 
-      for (let i = 0; i < windowLength; i += 1) {
-        const sky = skySeries[i];
-        const precip = precipSeries[i];
-        const vis = visibilitySeries[i];
-        const skyValue = typeof sky?.value === "number" ? sky.value : 100;
-        const precipValue = typeof precip?.value === "number" ? precip.value : 100;
-        const score = skyValue + precipValue * 0.5;
-        if (score < bestScore) {
-          bestScore = score;
-          bestIndex = i;
-        }
-        rows.push(
-          [
-            formatTimeRange(sky.validTime),
-            `Sky cover: ${sky.value ?? "?"}%`,
-            `Precip chance: ${precip?.value ?? "?"}%`,
-            `Visibility: ${formatVisibility(vis?.value ?? null, visibilityUnit)}`,
-          ].join(" | "),
-        );
-      }
-
-      const highlight = bestIndex >= 0 ? rows[bestIndex] : "No clear window detected.";
-      const insight = bestIndex >= 0
-        ? `Promising observing window: ${highlight}`
-        : "No promising window identified within the requested horizon.";
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: [
-              `Clear sky analysis for ${latitude.toFixed(4)}, ${longitude.toFixed(4)} (next ${windowLength} hours):`,
-              "",
-              insight,
-              "",
-              "Hourly breakdown:",
-              rows.join("\n"),
-            ].join("\n"),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Unable to analyze clear sky window. ${error instanceof Error ? error.message : ""}`.trim(),
-          },
-        ],
-      };
+const handleDailyForecast: ToolExecutor = async (rawArgs) => {
+  try {
+    const parsed = parseArguments(dailyForecastArgumentParser, rawArgs);
+    const { latitude, longitude } = parsed;
+    const periods = parsed.periods ?? 6;
+    const points = await getPointMetadata(latitude, longitude);
+    const forecastUrl = points.properties.forecast;
+    if (!forecastUrl) {
+      throw new Error("Forecast URL not available for this coordinate (outside NWS coverage).");
     }
-  },
-);
+    const forecast = await fetchJson<ForecastResponse>(forecastUrl);
+    const periodsData = forecast.properties?.periods ?? [];
+    return toTextResult(
+      formatForecast(periodsData, periods, `NWS forecast for ${latitude.toFixed(4)}, ${longitude.toFixed(4)}`),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return toTextResult(`Unable to fetch daily forecast. ${message}`, true);
+  }
+};
+
+const handleHourlyForecast: ToolExecutor = async (rawArgs) => {
+  try {
+    const parsed = parseArguments(hourlyForecastArgumentParser, rawArgs);
+    const { latitude, longitude } = parsed;
+    const hours = parsed.hours ?? 6;
+    const points = await getPointMetadata(latitude, longitude);
+    const hourlyUrl = points.properties.forecastHourly;
+    if (!hourlyUrl) {
+      throw new Error("Hourly forecast URL not available for this coordinate.");
+    }
+    const forecast = await fetchJson<ForecastResponse>(hourlyUrl);
+    const periodsData = forecast.properties?.periods ?? [];
+    return toTextResult(
+      formatForecast(periodsData, hours, `Hourly forecast for ${latitude.toFixed(4)}, ${longitude.toFixed(4)}`),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return toTextResult(`Unable to fetch hourly forecast. ${message}`, true);
+  }
+};
+
+const handleClearSkyWindow: ToolExecutor = async (rawArgs) => {
+  try {
+    const parsed = parseArguments(clearSkyArgumentParser, rawArgs);
+    const { latitude, longitude } = parsed;
+    const horizonHours = parsed.horizonHours ?? 12;
+    const points = await getPointMetadata(latitude, longitude);
+    const gridUrl = points.properties.forecastGridData;
+    if (!gridUrl) {
+      throw new Error("Grid data URL not available for this coordinate.");
+    }
+    const gridData = await fetchJson<GridpointResponse>(gridUrl);
+    const skySeries = gridData.properties.skyCover?.values ?? [];
+    if (!skySeries.length) {
+      throw new Error("Sky cover data not available.");
+    }
+    const precipSeries = gridData.properties.probabilityOfPrecipitation?.values ?? [];
+    const visibilitySeries = gridData.properties.visibility?.values ?? [];
+    const visibilityUnit = gridData.properties.visibility?.uom;
+
+    const windowLength = Math.min(horizonHours, skySeries.length);
+    let bestIndex = -1;
+    let bestScore = Number.POSITIVE_INFINITY;
+    const rows: string[] = [];
+
+    for (let i = 0; i < windowLength; i += 1) {
+      const sky = skySeries[i];
+      const precip = precipSeries[i];
+      const vis = visibilitySeries[i];
+      const skyValue = typeof sky?.value === "number" ? sky.value : 100;
+      const precipValue = typeof precip?.value === "number" ? precip.value : 100;
+      const score = skyValue + precipValue * 0.5;
+      if (score < bestScore) {
+        bestScore = score;
+        bestIndex = i;
+      }
+      rows.push(
+        [
+          formatTimeRange(sky.validTime),
+          `Sky cover: ${sky.value ?? "?"}%`,
+          `Precip chance: ${precip?.value ?? "?"}%`,
+          `Visibility: ${formatVisibility(vis?.value ?? null, visibilityUnit)}`,
+        ].join(" | "),
+      );
+    }
+
+    const highlight = bestIndex >= 0 ? rows[bestIndex] : "No clear window detected.";
+    const insight = bestIndex >= 0
+      ? `Promising observing window: ${highlight}`
+      : "No promising window identified within the requested horizon.";
+
+    return toTextResult(
+      [
+        `Clear sky analysis for ${latitude.toFixed(4)}, ${longitude.toFixed(4)} (next ${windowLength} hours):`,
+        "",
+        insight,
+        "",
+        "Hourly breakdown:",
+        rows.join("\n"),
+      ].join("\n"),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return toTextResult(`Unable to analyze clear sky window. ${message}`, true);
+  }
+};
+
+const toolHandlers: Record<string, ToolExecutor> = {
+  resolve_point_metadata: handleResolvePointMetadata,
+  get_daily_forecast: handleDailyForecast,
+  get_hourly_forecast: handleHourlyForecast,
+  get_clear_sky_window: handleClearSkyWindow,
+};
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: toolDefinitions,
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const toolName = request.params.name;
+  const rawArgs = (request.params.arguments ?? {}) as Record<string, unknown>;
+  const handler = toolHandlers[toolName];
+  if (!handler) {
+    return toTextResult(`Unknown tool: ${toolName}`, true);
+  }
+  try {
+    return await handler(rawArgs);
+  } catch (error) {
+    console.error(`Tool ${toolName} failed`, error);
+    const message = error instanceof Error ? error.message : String(error);
+    return toTextResult(`Tool '${toolName}' failed: ${message}`, true);
+  }
+});
 
 async function main() {
   const transport = new StdioServerTransport();

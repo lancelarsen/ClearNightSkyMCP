@@ -1,0 +1,12 @@
+{
+	"servers": {
+		"clear-night-sky": {
+			"type": "stdio",
+			"command": "node",
+			"args": [
+                "D:/Dev/Vibe/ClearNightSkyMCP/build/index.js"
+            ]
+		}
+	},
+	"inputs": []
+}
