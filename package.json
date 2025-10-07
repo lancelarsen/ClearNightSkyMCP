@@ -1,0 +1,28 @@
+{
+  "name": "clear-night-sky-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Clear Night Sky weather insights",
+  "type": "module",
+  "bin": {
+    "clear-night-sky-mcp": "./build/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node ./build/index.js"
+  },
+  "files": [
+    "build"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^0.4.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "typescript": "^5.4.5"
+  }
+}
